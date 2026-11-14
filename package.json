@@ -2,6 +2,7 @@
   "name": "pi-stop-continuation-guard",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "A bounded stop-continuation guard for the Pi coding agent",
   "type": "module",
   "engines": { "node": ">=22.18.0" },
