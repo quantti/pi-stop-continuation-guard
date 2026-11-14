@@ -12,7 +12,8 @@ or execute the judge's free-form suggestions.
 
 Requires Pi 1.3.0, Node.js 22.18 or newer, and authenticated access to
 `openai-codex/gpt-6-luna`. The judge must also be allowed by the session's model scope.
-This repository is private; Git access must already be configured.
+Git access must be configured if the repository is private. GitHub visibility is independent
+of the package's `private` flag, which prevents accidental npm publication.
 
 ```sh
 pi install git:github.com/quantti/pi-stop-continuation-guard
@@ -69,3 +70,8 @@ The installed-Pi integration test is skipped unless `PI_PACKAGE_DIR` points to t
 settlement, the custom-message continuation and cancellation against Pi 1.3.0.
 Tests use synthetic conversations and a fake provider, not your live credentials.
 Live semantic checks are separate from these deterministic tests.
+
+## License
+
+[MIT](LICENSE), copyright 2026 quantti. Credentials and model subscriptions are supplied
+by the user and are not included in the package.
