@@ -1,18 +1,32 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { test } from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { after, test } from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import extension from "../extensions/stop-continuation-guard.ts";
 
-function responseFor(packet, overrides = {}) {
-  return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({
-    decision: "continue", authorizingInputIds: packet.operatorInputs.map(i => i.id),
-    finalEntryId: packet.final.id, remainingWork: "Synchronize the two versions",
-    reason: "The requested synchronization is unfinished", independentWork: false, ...overrides,
-  }) }] };
+const configDir = await mkdtemp(path.join(tmpdir(), "pi-stop-guard-config-"));
+const oldConfig = process.env.PI_STOP_GUARD_CONFIG;
+const oldFetch = globalThis.fetch;
+const configPath = path.join(configDir, "guard.json");
+const keyPath = path.join(configDir, "key");
+const fixtureConfig = { endpoint: "https://judge.example.test/decisions", model: "fixture", apiKeyFile: keyPath };
+process.env.PI_STOP_GUARD_CONFIG = configPath;
+await writeFile(keyPath, "fixture-secret\n", { mode: 0o600 });
+await writeFile(configPath, JSON.stringify(fixtureConfig), { mode: 0o600 });
+after(async () => {
+  if (oldConfig === undefined) delete process.env.PI_STOP_GUARD_CONFIG;
+  else process.env.PI_STOP_GUARD_CONFIG = oldConfig;
+  globalThis.fetch = oldFetch;
+  await rm(configDir, { recursive: true, force: true });
+});
+
+function responseFor(packet, { decision = "continue", authorizingInputIds = [packet.operatorInputs[0]?.id] } = {}) {
+  return Response.json({ answers: {
+    outcome: { type: "choice", choice: decision === "continue" ? authorizingInputIds[0] ?? "continue" : decision },
+  } });
 }
 
 function host() {
@@ -35,14 +49,12 @@ function host() {
       getSessionId: () => "fixture-session", getSessionFile: () => undefined,
       getLeafId: () => leaf, getBranch: () => branch,
     },
-    modelRegistry: {
-      find: () => ({ provider: "openai-codex", id: "gpt-6-luna", api: "openai-codex-responses" }),
-      complete: async (model, context, options) => {
-        const packet = JSON.parse(context.messages[0].content);
-        calls.push({ model, context, options, packet });
-        return answer ? await answer(packet, options) : responseFor(packet);
-      },
-    },
+  };
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const packet = JSON.parse(body.state);
+    calls.push({ url, body, options, packet });
+    return answer ? await answer(packet, options) : responseFor(packet);
   };
   extension({
     on: (name, fn) => handlers.set(name, fn),
@@ -89,11 +101,31 @@ test("authorized unfinished work gets one visible native-boundary continuation",
   assert.equal(result.entries[1].display, true);
   assert.match(result.entries[1].content, /not a new user instruction/i);
   assert.ok(!result.entries[1].content.includes("Synchronize the two versions"), "no free-form judge command is pasted back");
-  assert.equal(h.calls[0].model.id, "gpt-6-luna");
-  assert.deepEqual(h.calls[0].context.tools, []);
-  assert.equal(h.calls[0].options.reasoningEffort, "low");
-  assert.equal(h.calls[0].options.maxRetries, 0, "do not inherit provider retries for the judge");
+  assert.equal(h.calls[0].url, fixtureConfig.endpoint);
+  assert.equal(h.calls[0].body.model, fixtureConfig.model);
+  assert.equal(h.calls[0].options.method, "POST");
+  assert.equal(h.calls[0].options.redirect, "error");
+  assert.equal(h.calls[0].options.headers.Authorization, "Bearer fixture-secret");
+  assert.ok(!h.calls[0].options.body.includes("fixture-secret"));
+  assert.deepEqual(Object.keys(h.calls[0].body.questions), ["outcome"]);
+  assert.deepEqual(Object.keys(h.calls[0].body.questions.outcome.criteria), ["complete", "needs_user", "uncertain", "input-1"]);
   assert.equal(h.calls[0].packet.operatorInputs[0].text, "Document ownership and synchronize both versions. Do not push.");
+});
+
+test("missing or unsafe configuration makes no request", async () => {
+  const original = process.env.PI_STOP_GUARD_CONFIG;
+  const unsafe = path.join(configDir, "unsafe.json");
+  try {
+    for (const endpoint of [undefined, "http://judge.example.test", "https://user:pass@judge.example.test", "https://judge.example.test/?key=secret"]) {
+      if (endpoint) await writeFile(unsafe, JSON.stringify({ ...fixtureConfig, endpoint }));
+      process.env.PI_STOP_GUARD_CONFIG = endpoint ? unsafe : path.join(configDir, "missing.json");
+      const h = host();
+      h.input("Synchronize both versions.");
+      assert.equal(await h.judge(h.finish()), undefined);
+      assert.equal(h.calls.length, 0);
+      assert.match(h.notices.at(-1), /configuration unavailable/);
+    }
+  } finally { process.env.PI_STOP_GUARD_CONFIG = original; }
 });
 
 test("judge gets only bounded tool outcome metadata, never raw tool output", async () => {
@@ -159,13 +191,13 @@ test("real waits, cancellation, queued continuations and non-TUI hosts never cal
 
 test("malformed judgments, forged references and provider failures fail closed without leaking diagnostics", async () => {
   const invalid = [
-    () => ({ stopReason: "stop", content: [{ type: "text", text: "not JSON" }] }),
+    () => new Response("not JSON"),
+    () => new Response("PRIVATE_PROVIDER_<REPLACE_ME>", { status: 503 }),
+    () => new Response("x".repeat(16_001)),
+    () => Response.json({ answers: { outcome: { type: "choice", choice: "continue" } } }),
     packet => responseFor(packet, { decision: "approve" }),
-    packet => responseFor(packet, { finalEntryId: "other-answer" }),
     packet => responseFor(packet, { authorizingInputIds: [] }),
     packet => responseFor(packet, { authorizingInputIds: ["invented"] }),
-    packet => responseFor(packet, { extra: "unrecognized" }),
-    packet => responseFor(packet, { remainingWork: "x".repeat(301) }),
     () => { throw new Error("PRIVATE_PROVIDER_<REPLACE_ME>"); },
   ];
   for (const answer of invalid) {
@@ -207,7 +239,7 @@ test("a judge ignoring abort still times out once without a retry", async (t) =>
   h.input("Synchronize both versions.");
   h.setAnswer(() => new Promise(() => {}));
   const pending = h.judge(h.finish());
-  t.mock.timers.tick(20_001);
+  t.mock.timers.tick(2_001);
   assert.equal(await pending, undefined);
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].options.signal.aborted, true);
@@ -233,15 +265,35 @@ test("two-correction cap is not reset by synthetic messages; off/report/status d
   assert.match(h.notices.at(-1), /off/);
 });
 
+test("short follow-ups do not hide the original task or a restriction at a premature status update", async () => {
+  const h = host();
+  const task = "Implement the change and verify it with the local integration test.";
+  const restriction = "Do not run anything against the shared database.";
+  h.input(task);
+  h.input(restriction);
+  for (const followUp of ["ok", "continue", "what remains?", "keep going", "yes", "please finish", "continue"])
+    h.input(followUp);
+  h.setAnswer(packet => {
+    const original = packet.operatorInputs.find(input => input.text === task);
+    const hasRestriction = packet.operatorInputs.some(input => input.text === restriction);
+    return !packet.incompleteContext && original && hasRestriction
+      ? responseFor(packet, { authorizingInputIds: [original.id], remainingWork: "Inspect local test setup and finish implementation" })
+      : responseFor(packet, { decision: "uncertain", authorizingInputIds: [], remainingWork: "" });
+  });
+  const result = await h.judge(h.finish("I have not implemented the change or run the integration test. I will continue and return when it is verified."));
+  assert.equal(result?.continue, true);
+  assert.match(result.entries.at(-1).content, /input-1\b/);
+});
+
 test("missing scope and bounded context limits do not grant authority", async () => {
-  for (const scenario of ["old-history", "long-input", "too-many-inputs", "attachment", "long-answer", "model-scope"]) {
+  for (const scenario of ["old-history", "long-input", "too-many-inputs", "oversized-packet", "attachment", "long-answer"]) {
     const h = host();
     if (scenario === "old-history") h.input("Injected task", "extension");
     else if (scenario === "long-input") h.input("x".repeat(2001));
-    else if (scenario === "too-many-inputs") for (let i = 0; i < 7; i++) h.input(`Restriction ${i}`);
+    else if (scenario === "too-many-inputs") for (let i = 0; i < 17; i++) h.input(`Restriction ${i}`);
+    else if (scenario === "oversized-packet") for (let i = 0; i < 9; i++) h.input("x".repeat(1999));
     else if (scenario === "attachment") h.emit("input", { source: "interactive", text: "Do what the picture says", images: [{}] });
     else h.input("Synchronize both versions.");
-    if (scenario === "model-scope") h.ctx.scopedModels = [{ model: { provider: "other", id: "other" } }];
     assert.equal(await h.judge(h.finish(scenario === "long-answer" ? "x".repeat(4001) : undefined)), undefined, scenario);
     const incomplete = ["long-input", "too-many-inputs", "attachment"].includes(scenario);
     assert.equal(h.calls.length, incomplete ? 1 : 0, scenario);
@@ -269,15 +321,13 @@ test("known owned background work is not duplicated; new work invalidates the in
   h.input("Synchronize both versions.");
   h.bus.emit("subagent:async-started", { sessionId: "fixture-session", id: "job-1" });
   assert.equal(await h.judge(h.finish()), undefined);
-  assert.equal(h.calls[0].packet.backgroundWorkPending, true);
-  h.setAnswer(packet => responseFor(packet, { independentWork: true }));
-  assert.equal((await h.judge(h.finish())).continue, true);
+  assert.equal(h.calls.length, 0);
   h.bus.emit("subagent:async-complete", { sessionId: "fixture-session", runId: "job-1" });
   let resolve;
   h.setAnswer(() => new Promise(done => { resolve = done; }));
   const pending = h.judge(h.finish());
   h.bus.emit("subagent:async-started", { sessionId: "fixture-session", id: "job-2" });
-  resolve(responseFor(h.calls.at(-1).packet, { independentWork: true }));
+  resolve(responseFor(h.calls.at(-1).packet));
   assert.equal(await pending, undefined, "cannot use a judgment made before background state changed");
 });
 
@@ -285,13 +335,21 @@ test("registered provider work is observed without importing or executing anothe
   const key = Symbol.for("pi-subagents.background-work.v1");
   const old = globalThis[key];
   try {
-    globalThis[key] = { version: 1, providers: new Map([["fixture", {
-      listActiveWork: () => [{ id: "owned-provider-job", sessionId: "fixture-session" }],
-    }]]) };
-    const h = host();
-    h.input("Synchronize both versions.");
-    assert.equal(await h.judge(h.finish()), undefined);
-    assert.equal(h.calls[0].packet.backgroundWorkPending, true);
+    const sessionIds = ["fixture-session", "/sessions/saved.jsonl"];
+    for (const owner of sessionIds) {
+      let jobs = [];
+      globalThis[key] = { version: 1, providers: new Map([["fixture", {
+        reconcile: () => { jobs = [{ id: "owned-provider-job", sessionId: owner }]; },
+        listActiveWork: context => jobs.filter(job => context.sessionIds?.includes(job.sessionId)),
+      }]]) };
+      const h = host();
+      h.ctx.sessionManager.getSessionFile = () => sessionIds[1];
+      h.emit("session_tree");
+      h.input("Synchronize both versions.");
+      assert.equal(await h.judge(h.finish()), undefined);
+      assert.equal(h.calls.length, 0);
+      assert.match(h.notices.at(-1), /background work active/);
+    }
     globalThis[key] = { version: 99, providers: new Map() };
     const invalid = host();
     invalid.input("Synchronize both versions.");
@@ -316,14 +374,11 @@ test("installed Pi actually resumes one provider request from the returned bound
       modelsStorePath: path.join(dir, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
     const main = fauxProvider({ provider: "stop-guard-fixture", models: [{ id: "fixture" }] });
     main.setResponses([fauxAssistantMessage("Ownership rule added; versions are not synchronized."), fauxAssistantMessage("Synchronized.")]);
-    const judge = fauxProvider({ provider: "openai-codex", models: [{ id: "gpt-6-luna" }] });
     runtime.registerNativeProvider(main.provider);
-    runtime.registerNativeProvider(judge.provider);
     let judgments = 0;
-    runtime.complete = async (model, context) => {
-      assert.equal(model.id, "gpt-6-luna");
-      assert.deepEqual(context.tools, []);
-      const packet = JSON.parse(context.messages[0].content);
+    globalThis.fetch = async (url, options) => {
+      assert.equal(url, fixtureConfig.endpoint);
+      const packet = JSON.parse(JSON.parse(options.body).state);
       return responseFor(packet, { decision: ++judgments === 1 ? "continue" : "complete" });
     };
     const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -355,7 +410,7 @@ test("installed Pi actually resumes one provider request from the returned bound
     let entered;
     const judging = new Promise(resolve => { entered = resolve; });
     let judgeSignal;
-    runtime.complete = async (_model, _context, options) => {
+    globalThis.fetch = async (_url, options) => {
       judgeSignal = options.signal;
       entered();
       return await new Promise(() => {});
