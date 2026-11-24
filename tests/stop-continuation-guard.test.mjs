@@ -233,12 +233,33 @@ test("two-correction cap is not reset by synthetic messages; off/report/status d
   assert.match(h.notices.at(-1), /off/);
 });
 
+test("short follow-ups do not hide the original task or a restriction at a premature status update", async () => {
+  const h = host();
+  const task = "Implement the change and verify it with the local integration test.";
+  const restriction = "Do not run anything against the shared database.";
+  h.input(task);
+  h.input(restriction);
+  for (const followUp of ["ok", "continue", "what remains?", "keep going", "yes", "please finish", "continue"])
+    h.input(followUp);
+  h.setAnswer(packet => {
+    const original = packet.operatorInputs.find(input => input.text === task);
+    const hasRestriction = packet.operatorInputs.some(input => input.text === restriction);
+    return !packet.incompleteContext && original && hasRestriction
+      ? responseFor(packet, { authorizingInputIds: [original.id], remainingWork: "Inspect local test setup and finish implementation" })
+      : responseFor(packet, { decision: "uncertain", authorizingInputIds: [], remainingWork: "" });
+  });
+  const result = await h.judge(h.finish("I have not implemented the change or run the integration test. I will continue and return when it is verified."));
+  assert.equal(result?.continue, true);
+  assert.match(result.entries.at(-1).content, /input-1\b/);
+});
+
 test("missing scope and bounded context limits do not grant authority", async () => {
-  for (const scenario of ["old-history", "long-input", "too-many-inputs", "attachment", "long-answer", "model-scope"]) {
+  for (const scenario of ["old-history", "long-input", "too-many-inputs", "oversized-packet", "attachment", "long-answer", "model-scope"]) {
     const h = host();
     if (scenario === "old-history") h.input("Injected task", "extension");
     else if (scenario === "long-input") h.input("x".repeat(2001));
-    else if (scenario === "too-many-inputs") for (let i = 0; i < 7; i++) h.input(`Restriction ${i}`);
+    else if (scenario === "too-many-inputs") for (let i = 0; i < 17; i++) h.input(`Restriction ${i}`);
+    else if (scenario === "oversized-packet") for (let i = 0; i < 9; i++) h.input("x".repeat(1999));
     else if (scenario === "attachment") h.emit("input", { source: "interactive", text: "Do what the picture says", images: [{}] });
     else h.input("Synchronize both versions.");
     if (scenario === "model-scope") h.ctx.scopedModels = [{ model: { provider: "other", id: "other" } }];

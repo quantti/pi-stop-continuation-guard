@@ -38,9 +38,10 @@ allowance; synthetic extension messages do not.
 
 ## Limits
 
-The guard observes up to six human inputs, bounded to 2,000 characters each, plus
-bounded transcript excerpts, the final answer and tool names/error flags. It does not
-send raw tool output to the judge. Missing or clipped authorization and image-based
+The guard observes up to 16 human inputs, with a limit of 2,000 characters each. It
+also includes short transcript excerpts, the final answer, tool names, and tool error
+flags. If the full packet exceeds 16,000 characters, the guard does not call the judge.
+It does not send raw tool output. Missing or clipped authorization and image-based
 instructions cannot authorize a continuation.
 
 Each eligible stop makes a separate tool-free model call, with no provider retry and
