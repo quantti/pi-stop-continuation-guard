@@ -121,7 +121,10 @@ export default function (pi: ExtensionAPI) {
 				!("providers" in registry) || !(registry.providers instanceof Map) || registry.providers.size > 100) throw new Error("Background state unavailable");
 			for (const [name, provider] of registry.providers) {
 				if (typeof name !== "string" || !provider || typeof provider.listActiveWork !== "function") throw new Error("Background state unavailable");
-				const items: unknown = provider.listActiveWork({ sessionId: [...ownerIds].at(-1), nowMs: Date.now() });
+				const sessionIds = [...ownerIds];
+				const context = { sessionId: sessionIds[0], sessionIds, nowMs: Date.now() };
+				provider.reconcile?.({ ...context, sessionIds: [...sessionIds] });
+				const items: unknown = provider.listActiveWork(context);
 				if (!Array.isArray(items) || items.length > 1000) throw new Error("Background state limit");
 				for (const item of items) {
 					if (!item || typeof item.id !== "string" || typeof item.sessionId !== "string") throw new Error("Background state unavailable");

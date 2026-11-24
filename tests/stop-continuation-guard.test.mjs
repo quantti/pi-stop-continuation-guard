@@ -335,13 +335,21 @@ test("registered provider work is observed without importing or executing anothe
   const key = Symbol.for("pi-subagents.background-work.v1");
   const old = globalThis[key];
   try {
-    globalThis[key] = { version: 1, providers: new Map([["fixture", {
-      listActiveWork: () => [{ id: "owned-provider-job", sessionId: "fixture-session" }],
-    }]]) };
-    const h = host();
-    h.input("Synchronize both versions.");
-    assert.equal(await h.judge(h.finish()), undefined);
-    assert.equal(h.calls.length, 0);
+    const sessionIds = ["fixture-session", "/sessions/saved.jsonl"];
+    for (const owner of sessionIds) {
+      let jobs = [];
+      globalThis[key] = { version: 1, providers: new Map([["fixture", {
+        reconcile: () => { jobs = [{ id: "owned-provider-job", sessionId: owner }]; },
+        listActiveWork: context => jobs.filter(job => context.sessionIds?.includes(job.sessionId)),
+      }]]) };
+      const h = host();
+      h.ctx.sessionManager.getSessionFile = () => sessionIds[1];
+      h.emit("session_tree");
+      h.input("Synchronize both versions.");
+      assert.equal(await h.judge(h.finish()), undefined);
+      assert.equal(h.calls.length, 0);
+      assert.match(h.notices.at(-1), /background work active/);
+    }
     globalThis[key] = { version: 99, providers: new Map() };
     const invalid = host();
     invalid.input("Synchronize both versions.");
